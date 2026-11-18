@@ -1404,6 +1404,11 @@ internal fun PlayerRuntimeController.initializePlayer(
                         refreshStableProgressResetGate()
                     }
 
+                    override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                        // Passthrough that a speed change deferred comes back on pause, where its seek is hidden.
+                        playbackSpeedAwareAudioSink?.setPlayIntent(playWhenReady)
+                    }
+
                     override fun onIsPlayingChanged(isPlaying: Boolean) {
                         logScrobbleDiagnostic(
                             "exo_is_playing_changed",

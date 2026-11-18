@@ -1,5 +1,6 @@
 package com.nuvio.tv.ui.screens.player
 
+import android.util.Log
 import androidx.media3.common.Format
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackParameters
@@ -14,6 +15,12 @@ import androidx.media3.exoplayer.audio.ForwardingAudioSink
  *
  * Bluetooth cannot carry TrueHD / Atmos / DTS-HD passthrough. Forcing PCM lets MediaCodec/FFmpeg
  * decode to the format the BT stack actually accepts; the system then encodes to SBC/AAC/aptX/LDAC.
+ *
+ * Every switch between passthrough and PCM makes Media3 reselect tracks and seek to the current
+ * position, which stalls playback. So a return to 1x while playing keeps PCM, and passthrough comes
+ * back on the next pause (see [setPlayIntent]). Without this, the watch party speed nudges stalled
+ * twice per nudge, and the stall at the end of one nudge pushed playback out of sync again,
+ * starting the next.
  */
 internal class PlaybackSpeedAwareAudioSink(
     sink: AudioSink,
@@ -39,6 +46,13 @@ internal class PlaybackSpeedAwareAudioSink(
     @Volatile
     private var listener: AudioSink.Listener? = null
 
+    // Assume playing until told otherwise, so passthrough is never restored mid-playback by mistake.
+    @Volatile
+    private var playIntent: Boolean = true
+
+    @Volatile
+    private var restorePassthroughWhenPaused: Boolean = false
+
     fun setInitialPlaybackSpeed(speed: Float) {
         playbackSpeed = normalizeSpeed(speed)
         markPcmFallbackIfNeeded(currentInputFormat, playbackSpeed)
@@ -60,6 +74,7 @@ internal class PlaybackSpeedAwareAudioSink(
         } else if (!startedWithForcedPcm && playbackSpeed == 1f) {
             // Session was not built as PCM-only; leaving Bluetooth can restore passthrough.
             forcePcmForCurrentSession = false
+            restorePassthroughWhenPaused = false
         }
         return wasBluetoothForce != bluetoothForcePcm || wasSessionForce != forcePcmForCurrentSession
     }
@@ -80,17 +95,49 @@ internal class PlaybackSpeedAwareAudioSink(
     override fun setPlaybackParameters(playbackParameters: PlaybackParameters) {
         playbackSpeed = normalizeSpeed(playbackParameters.speed)
         var shouldNotify = markPcmFallbackIfNeeded(currentInputFormat, playbackSpeed)
-        // Going above 1x latches forcePcm for the session. Clear it when back at 1.0x
-        // so passthrough can recover (unless recovery built us with forcePcm).
-        if (playbackSpeed == 1f && forcePcmForCurrentSession && !startedWithForcedPcm) {
-            forcePcmForCurrentSession = false
-            shouldNotify = true
+        if (shouldNotify) Log.i(TAG, "Speed $playbackSpeed; switching to PCM")
+        if (playbackSpeed != 1f) {
+            restorePassthroughWhenPaused = false
+        } else if (isPcmForcedBySpeed()) {
+            // Back at 1x, so passthrough can recover. While playing, switching now would stall
+            // playback; keep PCM, which handles any later speed change seamlessly, until a pause.
+            if (playIntent) {
+                if (!restorePassthroughWhenPaused) {
+                    Log.i(TAG, "Back at 1x while playing; keeping PCM until the next pause")
+                }
+                restorePassthroughWhenPaused = true
+            } else {
+                Log.i(TAG, "Back at 1x while paused; restoring passthrough")
+                forcePcmForCurrentSession = false
+                shouldNotify = true
+            }
         }
         super.setPlaybackParameters(playbackParameters)
         if (shouldNotify) {
             listener?.onAudioCapabilitiesChanged()
         }
     }
+
+    /**
+     * Tells the sink whether the player intends to play. A passthrough restore that
+     * [setPlaybackParameters] deferred happens on the next pause, where its reselect seek is hidden.
+     *
+     * @return true when this restored passthrough and notified the renderer.
+     */
+    fun setPlayIntent(playing: Boolean): Boolean {
+        playIntent = playing
+        if (playing || !restorePassthroughWhenPaused) return false
+        restorePassthroughWhenPaused = false
+        if (playbackSpeed != 1f || !isPcmForcedBySpeed()) return false
+        Log.i(TAG, "Paused at 1x; restoring passthrough")
+        forcePcmForCurrentSession = false
+        listener?.onAudioCapabilitiesChanged()
+        return true
+    }
+
+    /** PCM forced only by a speed change, so returning to 1x may restore passthrough. */
+    private fun isPcmForcedBySpeed(): Boolean =
+        forcePcmForCurrentSession && !startedWithForcedPcm && !bluetoothForcePcm
 
     fun notifyAudioProcessingRequirementChanged() {
         listener?.onAudioCapabilitiesChanged()
@@ -177,5 +224,9 @@ internal class PlaybackSpeedAwareAudioSink(
                 codecs.contains("dtshd", ignoreCase = true)
         }
         return false
+    }
+
+    private companion object {
+        const val TAG = "PlaybackSpeedAudioSink"
     }
 }

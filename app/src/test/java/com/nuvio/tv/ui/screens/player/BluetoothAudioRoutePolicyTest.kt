@@ -80,6 +80,85 @@ class BluetoothAudioRoutePolicyTest {
     }
 
     @Test
+    fun `return to 1x while playing keeps pcm until the next pause`() {
+        val listener = RecordingListener()
+        val (sink, eac3) = playingEac3Sink(listener)
+
+        sink.setPlaybackParameters(PlaybackParameters(1.05f))
+        assertEquals(1, listener.capabilityChanges)
+
+        // Party nudges end and restart without switching the output path again.
+        sink.setPlaybackParameters(PlaybackParameters(1f))
+        sink.setPlaybackParameters(PlaybackParameters(0.95f))
+        sink.setPlaybackParameters(PlaybackParameters(1f))
+        assertEquals(1, listener.capabilityChanges)
+        assertTrue(sink.shouldForcePcmForFormat(eac3))
+
+        assertTrue(sink.setPlayIntent(false))
+        assertEquals(2, listener.capabilityChanges)
+        assertFalse(sink.shouldForcePcmForFormat(eac3))
+        assertEquals(AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY, sink.getFormatSupport(eac3))
+    }
+
+    @Test
+    fun `return to 1x while paused restores passthrough at once`() {
+        val listener = RecordingListener()
+        val (sink, eac3) = playingEac3Sink(listener)
+        sink.setPlayIntent(false)
+
+        sink.setPlaybackParameters(PlaybackParameters(1.25f))
+        sink.setPlaybackParameters(PlaybackParameters(1f))
+
+        assertEquals(2, listener.capabilityChanges)
+        assertFalse(sink.shouldForcePcmForFormat(eac3))
+    }
+
+    @Test
+    fun `pause at a non 1x speed keeps pcm until speed returns to 1x`() {
+        val listener = RecordingListener()
+        val (sink, eac3) = playingEac3Sink(listener)
+        sink.setPlaybackParameters(PlaybackParameters(1.05f))
+
+        assertFalse(sink.setPlayIntent(false))
+        assertTrue(sink.shouldForcePcmForFormat(eac3))
+
+        sink.setPlaybackParameters(PlaybackParameters(1f))
+        assertEquals(2, listener.capabilityChanges)
+        assertFalse(sink.shouldForcePcmForFormat(eac3))
+    }
+
+    @Test
+    fun `speeding up again cancels a deferred passthrough restore`() {
+        val listener = RecordingListener()
+        val (sink, eac3) = playingEac3Sink(listener)
+        sink.setPlaybackParameters(PlaybackParameters(1.05f))
+        sink.setPlaybackParameters(PlaybackParameters(1f))
+        sink.setPlaybackParameters(PlaybackParameters(1.05f))
+
+        assertFalse(sink.setPlayIntent(false))
+        assertEquals(1, listener.capabilityChanges)
+        assertTrue(sink.shouldForcePcmForFormat(eac3))
+    }
+
+    @Test
+    fun `speed changes never release bluetooth or recovery pcm`() {
+        val eac3 = mime(MimeTypes.AUDIO_E_AC3)
+        val bluetooth = PlaybackSpeedAwareAudioSink(AlwaysSupportedDelegateSink())
+        bluetooth.setBluetoothForcePcm(true)
+        val recovery = PlaybackSpeedAwareAudioSink(AlwaysSupportedDelegateSink(), initialForcePcm = true)
+        for (sink in listOf(bluetooth, recovery)) {
+            val listener = RecordingListener()
+            sink.setListener(listener)
+            sink.configure(eac3, 0, null)
+            sink.setPlaybackParameters(PlaybackParameters(1.25f))
+            sink.setPlaybackParameters(PlaybackParameters(1f))
+            sink.setPlayIntent(false)
+            assertEquals(0, listener.capabilityChanges)
+            assertTrue(sink.shouldForcePcmForFormat(eac3))
+        }
+    }
+
+    @Test
     fun `bluetooth connect or disconnect never asks to reinitialize the player`() {
         assertEquals(
             BluetoothRoutePlaybackAction.UPDATE_SINK_IN_PLACE,
@@ -265,6 +344,25 @@ class BluetoothAudioRoutePolicyTest {
             .setChannelCount(6)
             .setSampleRate(48_000)
             .build()
+    }
+
+    private fun playingEac3Sink(listener: AudioSink.Listener): Pair<PlaybackSpeedAwareAudioSink, Format> {
+        val eac3 = mime(MimeTypes.AUDIO_E_AC3)
+        val sink = PlaybackSpeedAwareAudioSink(AlwaysSupportedDelegateSink())
+        sink.setListener(listener)
+        sink.configure(eac3, 0, null)
+        sink.setPlayIntent(true)
+        return sink to eac3
+    }
+
+    private class RecordingListener : AudioSink.Listener {
+        var capabilityChanges = 0
+        override fun onAudioCapabilitiesChanged() {
+            capabilityChanges += 1
+        }
+        override fun onPositionDiscontinuity() = Unit
+        override fun onUnderrun(bufferSize: Int, bufferSizeMs: Long, elapsedSinceLastFeedMs: Long) = Unit
+        override fun onSkipSilenceEnabledChanged(skipSilenceEnabled: Boolean) = Unit
     }
 
     private class AlwaysSupportedDelegateSink : ForwardingAudioSink(NoOpBaseSink())
